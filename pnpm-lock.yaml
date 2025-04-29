@@ -270,6 +270,31 @@ importers:
         specifier: ^5.8.2
         version: 5.8.2
 
+  examples/with-google-vertex-ai:
+    dependencies:
+      '@voltagent/cli':
+        specifier: ^0.1.3
+        version: link:../../packages/cli
+      '@voltagent/core':
+        specifier: ^0.1.8
+        version: link:../../packages/core
+      '@voltagent/google-ai':
+        specifier: ^0.3.0
+        version: link:../../packages/google-ai
+      zod:
+        specifier: ^3.24.2
+        version: 3.24.2
+    devDependencies:
+      '@types/node':
+        specifier: ^22.13.5
+        version: 22.14.0
+      tsx:
+        specifier: ^4.19.3
+        version: 4.19.3
+      typescript:
+        specifier: ^5.8.2
+        version: 5.8.2
+
   examples/with-groq-ai:
     dependencies:
       '@voltagent/cli':
