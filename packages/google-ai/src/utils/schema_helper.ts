@@ -463,6 +463,10 @@ export interface ZodFunction {
   zodFunctionSchema: z.ZodFunction<z.ZodTuple<any, z.ZodTypeAny>, z.ZodTypeAny>;
 }
 
+function isZodSchema(obj: any): obj is z.ZodTypeAny {
+  return obj?._def?.typeName === "ZodObject";
+}
+
 /**
  * Converts a Zod function schema definition into a FunctionDeclaration object.
  *
@@ -505,7 +509,7 @@ export function functionDeclarationFromZodFunction(
   }
   if (functionParams.length === 1) {
     const param = functionParams[0];
-    if (param instanceof z.ZodObject) {
+    if (param instanceof z.ZodObject || isZodSchema(param)) {
       functionDeclaration.parameters = processZodSchema(vertaxai, functionParams[0]);
     } else {
       if (!(param instanceof z.ZodVoid)) {
