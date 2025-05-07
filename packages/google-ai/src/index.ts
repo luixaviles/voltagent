@@ -170,7 +170,7 @@ export class GoogleGenAIProvider implements LLMProvider<string> {
   }): StepWithContent | null => {
     if (chunk.type === "text" && chunk.text) {
       return {
-        id: "",
+        id: chunk.responseId || "",
         type: "text",
         content: chunk.text,
         role: "assistant" as MessageRole,
@@ -381,6 +381,7 @@ export class GoogleGenAIProvider implements LLMProvider<string> {
       const step = this._createStepFromChunk({
         type: "text",
         text: responseText,
+        responseId: response.responseId,
         usage: finalUsage,
       });
       if (step) await options.onStepFinish(step);
