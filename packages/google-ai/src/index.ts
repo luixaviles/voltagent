@@ -10,6 +10,7 @@ import {
   type Part,
   type FunctionCall,
   createPartFromFunctionResponse,
+  FinishReason,
 } from "@google/genai";
 import type {
   BaseMessage,
@@ -400,61 +401,61 @@ export class GoogleGenAIProvider implements LLMProvider<string> {
   private async _processStreamChunk(
     chunkResponse: GenerateContentResponse,
     controller: ReadableStreamDefaultController<string>,
-    state: StreamProcessingState,
+    streamState: StreamProcessingState & { isPausedForFunctionCalling?: boolean },
     options: GoogleStreamTextOptions,
   ): Promise<void> {
     const textChunk = chunkResponse.text;
-
     const chunkUsage = this._getUsageInfo(chunkResponse.usageMetadata);
     const chunkFinishReason = chunkResponse.candidates?.[0]?.finishReason?.toString();
 
+    // Update overall state with the latest usage/finish reason from any chunk
     if (chunkUsage) {
-      state.finalUsage = chunkUsage;
+      streamState.finalUsage = chunkUsage;
     }
     if (chunkFinishReason) {
-      state.finalFinishReason = chunkFinishReason;
+      streamState.finalFinishReason = chunkFinishReason;
     }
 
-    if (textChunk !== undefined && textChunk !== "") {
+    // Only process/enqueue text if not paused
+    if (textChunk !== undefined && textChunk !== "" && !streamState.isPausedForFunctionCalling) {
       controller.enqueue(textChunk);
-      state.accumulatedText += textChunk;
+      streamState.accumulatedText += textChunk;
       if (options.onChunk) {
         const step = this._createStepFromChunk({
-          id: chunkResponse.responseId || "",
           type: "text",
-          text: chunkResponse.text,
-          role: "assistant",
-          usage: undefined,
+          text: textChunk,
+          responseId: chunkResponse.responseId,
+          usage: chunkUsage,
         });
         if (step) await options.onChunk(step);
       }
     }
 
     if (chunkResponse.promptFeedback && options.onError) {
-      console.warn("Prompt feedback received:", chunkResponse.promptFeedback);
+      // Handle of promptFeedback during streaming
+      console.warn("Prompt feedback received during stream:", chunkResponse.promptFeedback);
     }
   }
 
   private async _finalizeStream(
-    state: StreamProcessingState,
+    streamState: StreamProcessingState, // Uses the final accumulated state
     options: GoogleStreamTextOptions,
     controller: ReadableStreamDefaultController<string>,
   ): Promise<void> {
-    const finalUsage = state.finalUsage;
-
+    // Call onStepFinish with the complete accumulated text and final usage
     if (options.onStepFinish) {
       const finalStep: StepWithContent = {
         id: "",
         type: "text",
-        content: state.accumulatedText,
+        content: streamState.accumulatedText,
         role: "assistant",
-        usage: finalUsage,
+        usage: streamState.finalUsage,
       };
       await options.onStepFinish(finalStep);
     }
+    // Call onFinish with the final text
     if (options.onFinish) {
-      const finishResponse: { text: string } = { text: state.accumulatedText };
-      await options.onFinish(finishResponse);
+      await options.onFinish({ text: streamState.accumulatedText });
     }
     controller.close();
   }
@@ -463,7 +464,7 @@ export class GoogleGenAIProvider implements LLMProvider<string> {
     options: GoogleStreamTextOptions,
   ): Promise<ProviderTextStreamResponse<GoogleGenerateContentStreamResult>> {
     const model = options.model;
-    const contents = options.messages.map(this.toMessage);
+    const currentContents = options.messages.map(this.toMessage);
     const providerOptions: GoogleProviderRuntimeOptions = options.provider || {};
 
     const config: GenerateContentConfig = Object.entries({
@@ -481,31 +482,154 @@ export class GoogleGenAIProvider implements LLMProvider<string> {
       return acc;
     }, {} as GenerateContentConfig);
 
-    const generationParams: GenerateContentParameters = {
-      contents: contents,
+    const availableTools: BaseTool[] = options.tools || [];
+    const initialConfig = { ...config };
+    if (availableTools.length > 0) {
+      const { tools, toolConfig } = prepareToolsForGoogleSDK(availableTools, this.isVertexAI);
+      Object.assign(initialConfig, { tools: [tools], toolConfig });
+    }
+
+    // Use const for initialGenerationParams as it's assigned once
+    const initialGenerationParams: GenerateContentParameters = {
+      contents: currentContents,
       model: model,
-      ...(Object.keys(config).length > 0 ? { config: config } : {}),
+      ...(Object.keys(initialConfig).length > 0 ? { config: initialConfig } : {}),
     };
 
-    const streamResult = await this.ai.models.generateContentStream(generationParams);
+    // Initiate the first stream call before creating the ReadableStream
+    const initialStreamResult = await this.ai.models.generateContentStream(initialGenerationParams);
+    const state = this; // Reference to 'this' for use inside stream logic
+    let streamIterator: AsyncGenerator<GenerateContentResponse> = initialStreamResult;
 
-    const state = this;
-    const streamState: StreamProcessingState = {
+    const streamState: StreamProcessingState & { isPausedForFunctionCalling?: boolean } = {
       accumulatedText: "",
-      finalUsage: undefined as UsageInfo | undefined,
-      finalFinishReason: undefined as string | undefined,
+      finalUsage: undefined,
+      finalFinishReason: undefined,
+      isPausedForFunctionCalling: false,
     };
 
     const readableStream = new ReadableStream<string>({
       async start(controller) {
         try {
-          for await (const chunkResponse of streamResult) {
-            await state._processStreamChunk(chunkResponse, controller, streamState, options);
+          let processingComplete = false;
+          let loopCount = 0; // Safety break
+          // Track contents for API calls, re-initialize if a second call happens
+          let currentApiCallContents = [...currentContents];
+
+          while (!processingComplete && loopCount < 10) {
+            loopCount++;
+            if (!streamIterator) {
+              console.error(
+                "[GoogleGenAIProvider] Stream iterator became null during processing loop.",
+              );
+              throw new Error("Stream iterator became null during processing loop.");
+            }
+
+            const currentChunkBuffer: GenerateContentResponse[] = [];
+            let functionCallsDetected: FunctionCall[] = [];
+            let finalChunkOfPass: GenerateContentResponse | null = null;
+
+            // Process each chunk in the stream
+            for await (const chunkResponse of streamIterator) {
+              finalChunkOfPass = chunkResponse;
+              await state._processStreamChunk(chunkResponse, controller, streamState, options);
+              currentChunkBuffer.push(chunkResponse);
+
+              // Aggregate function calls from all chunks in this pass
+              const callsInChunk = chunkResponse.functionCalls;
+              if (callsInChunk && callsInChunk.length > 0) {
+                functionCallsDetected.push(...callsInChunk);
+                // Don't pause here, process the whole stream first
+              }
+            }
+
+            // Check for function calls after processing all chunks
+            if (functionCallsDetected.length > 0) {
+              streamState.isPausedForFunctionCalling = true;
+
+              // Execute function calls
+              const functionResponses = await executeFunctionCalls(
+                functionCallsDetected,
+                availableTools,
+              );
+
+              const functionResponseParts: Part[] = functionResponses
+                .map((funcResponse) => {
+                  if (!funcResponse.id || !funcResponse.name || !funcResponse.response) {
+                    console.warn(
+                      "[GoogleGenAIProvider]Invalid FunctionResponse format, skipping:",
+                      funcResponse,
+                    );
+                    return null;
+                  }
+                  return createPartFromFunctionResponse(
+                    funcResponse.id,
+                    funcResponse.name,
+                    funcResponse.response,
+                  );
+                })
+                .filter((part): part is Part => part !== null);
+
+              if (functionResponseParts.length > 0) {
+                // Add model's turn (captured from the final chunk of the previous pass)
+                const modelTurnContent = finalChunkOfPass?.candidates?.[0]?.content;
+                if (modelTurnContent) {
+                  // Re-assign contents for the next call's history
+                  currentApiCallContents = [
+                    ...currentApiCallContents, // Previous history
+                    modelTurnContent, // Model's turn that led to function call
+                    { role: "function", parts: functionResponseParts }, // Function results
+                  ];
+                } else {
+                  console.warn(
+                    "[GoogleGenAIProvider] Could not reliably determine model's content for history. Next call might lack context.",
+                  );
+                  // Proceed, but history for the next call might be incomplete
+                  currentApiCallContents = [
+                    ...currentApiCallContents, // Previous history
+                    { role: "function", parts: functionResponseParts }, // Function results only
+                  ];
+                }
+
+                // Prepare config for the next call (remove tools)
+                const { tools, toolConfig, ...secondCallConfigBase } = initialConfig;
+                const secondCallConfig = secondCallConfigBase;
+
+                const secondGenParams: GenerateContentParameters = {
+                  contents: currentApiCallContents, // Use updated contents
+                  model: model,
+                  ...(Object.keys(secondCallConfig).length > 0 ? { config: secondCallConfig } : {}),
+                };
+
+                // Assign the new stream iterator
+                streamIterator = await state.ai.models.generateContentStream(secondGenParams);
+                streamState.isPausedForFunctionCalling = false; // Unpause for the next pass
+                functionCallsDetected = []; // Reset for next pass
+                // Loop continues with the new iterator
+              } else {
+                console.warn(
+                  "[GoogleGenAIProvider] No valid function responses generated. Finalizing stream.",
+                );
+                processingComplete = true; // Stop loop if responses are invalid
+              }
+            } else {
+              // No function calls detected in this pass, the stream finished naturally or with a terminal reason
+              processingComplete = true; // Mark as complete to exit the while loop
+            }
+          } // End while(!processingComplete)
+
+          if (loopCount >= 10) {
+            console.warn(
+              "[GoogleGenAIProvider] Exited stream processing loop due to reaching max iterations (10). Finalizing.",
+            );
           }
 
           await state._finalizeStream(streamState, options, controller);
         } catch (error) {
-          console.error("Error during Google GenAI stream processing:", error);
+          console.error(
+            "[GoogleGenAIProvider] Error during Google GenAI stream processing:",
+            error,
+          );
           if (options.onError) {
             await options.onError(error);
           }
@@ -513,12 +637,12 @@ export class GoogleGenAIProvider implements LLMProvider<string> {
         }
       },
       cancel(reason) {
-        console.log("Google GenAI Stream cancelled:", reason);
+        console.debug("[GoogleGenAIProvider] Google GenAI Stream cancelled:", reason);
       },
     });
 
     return {
-      provider: streamResult,
+      provider: initialStreamResult,
       textStream: readableStream,
     };
   }
