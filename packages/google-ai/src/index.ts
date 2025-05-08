@@ -10,7 +10,6 @@ import {
   type Part,
   type FunctionCall,
   createPartFromFunctionResponse,
-  FinishReason,
 } from "@google/genai";
 import type {
   BaseMessage,
@@ -460,6 +459,138 @@ export class GoogleGenAIProvider implements LLMProvider<string> {
     controller.close();
   }
 
+  private async _processStreamFunctionCalls(
+    functionCallsDetected: FunctionCall[],
+    availableTools: BaseTool[],
+    finalChunkOfPass: GenerateContentResponse | null,
+    currentApiCallContents: Content[],
+    model: string,
+    initialConfig: GenerateContentConfig,
+  ): Promise<AsyncGenerator<GenerateContentResponse> | null> {
+    const functionResponses = await executeFunctionCalls(functionCallsDetected, availableTools);
+
+    const functionResponseParts: Part[] = functionResponses
+      .map((funcResponse) => {
+        if (!funcResponse.id || !funcResponse.name || !funcResponse.response) {
+          console.warn(
+            "[GoogleGenAIProvider]Invalid FunctionResponse format, skipping:",
+            funcResponse,
+          );
+          return null;
+        }
+        return createPartFromFunctionResponse(
+          funcResponse.id,
+          funcResponse.name,
+          funcResponse.response,
+        );
+      })
+      .filter((part): part is Part => part !== null);
+
+    if (functionResponseParts.length === 0) {
+      console.warn(
+        "[GoogleGenAIProvider] No valid function responses generated. Finalizing stream.",
+      );
+      return null;
+    }
+
+    const modelTurnContent = finalChunkOfPass?.candidates?.[0]?.content;
+    const updatedContents = modelTurnContent
+      ? [
+          ...currentApiCallContents,
+          modelTurnContent,
+          { role: "function", parts: functionResponseParts },
+        ]
+      : [...currentApiCallContents, { role: "function", parts: functionResponseParts }];
+
+    const { tools, toolConfig, ...secondCallConfig } = initialConfig;
+    const secondGenParams: GenerateContentParameters = {
+      contents: updatedContents,
+      model: model,
+      ...(Object.keys(secondCallConfig).length > 0 ? { config: secondCallConfig } : {}),
+    };
+
+    return this.ai.models.generateContentStream(secondGenParams);
+  }
+
+  private async _processStreamIterator(
+    streamIterator: AsyncGenerator<GenerateContentResponse>,
+    controller: ReadableStreamDefaultController<string>,
+    streamState: StreamProcessingState & { isPausedForFunctionCalling?: boolean },
+    options: GoogleStreamTextOptions,
+  ): Promise<{ functionCalls: FunctionCall[]; finalChunk: GenerateContentResponse | null }> {
+    const functionCalls: FunctionCall[] = [];
+    let finalChunk: GenerateContentResponse | null = null;
+
+    for await (const chunkResponse of streamIterator) {
+      finalChunk = chunkResponse;
+      await this._processStreamChunk(chunkResponse, controller, streamState, options);
+
+      const callsInChunk = chunkResponse.functionCalls;
+      if (callsInChunk && callsInChunk.length > 0) {
+        functionCalls.push(...callsInChunk);
+      }
+    }
+
+    return { functionCalls, finalChunk };
+  }
+
+  private async _processStreamWithFunctionCalls(
+    streamIterator: AsyncGenerator<GenerateContentResponse>,
+    controller: ReadableStreamDefaultController<string>,
+    streamState: StreamProcessingState & { isPausedForFunctionCalling?: boolean },
+    options: GoogleStreamTextOptions,
+    availableTools: BaseTool[],
+    currentApiCallContents: Content[],
+    model: string,
+    initialConfig: GenerateContentConfig,
+  ): Promise<void> {
+    let processingComplete = false;
+    let loopCount = 0;
+    let currentIterator = streamIterator;
+
+    // limit the number of iterations to prevent infinite loops in the streaming process.
+    while (!processingComplete && loopCount < 10) {
+      loopCount++;
+      if (!currentIterator) {
+        throw new Error("Stream iterator became null during processing loop.");
+      }
+
+      const { functionCalls, finalChunk } = await this._processStreamIterator(
+        currentIterator,
+        controller,
+        streamState,
+        options,
+      );
+
+      if (functionCalls.length > 0) {
+        streamState.isPausedForFunctionCalling = true;
+        const newIterator = await this._processStreamFunctionCalls(
+          functionCalls,
+          availableTools,
+          finalChunk,
+          currentApiCallContents,
+          model,
+          initialConfig,
+        );
+
+        if (newIterator) {
+          currentIterator = newIterator;
+          streamState.isPausedForFunctionCalling = false;
+        } else {
+          processingComplete = true;
+        }
+      } else {
+        processingComplete = true;
+      }
+    }
+
+    if (loopCount >= 10) {
+      console.warn(
+        "[GoogleGenAIProvider] Exited stream processing loop due to reaching max iterations (10).",
+      );
+    }
+  }
+
   async streamText(
     options: GoogleStreamTextOptions,
   ): Promise<ProviderTextStreamResponse<GoogleGenerateContentStreamResult>> {
@@ -489,17 +620,16 @@ export class GoogleGenAIProvider implements LLMProvider<string> {
       Object.assign(initialConfig, { tools: [tools], toolConfig });
     }
 
-    // Use const for initialGenerationParams as it's assigned once
     const initialGenerationParams: GenerateContentParameters = {
       contents: currentContents,
       model: model,
       ...(Object.keys(initialConfig).length > 0 ? { config: initialConfig } : {}),
     };
 
-    // Initiate the first stream call before creating the ReadableStream
     const initialStreamResult = await this.ai.models.generateContentStream(initialGenerationParams);
-    const state = this; // Reference to 'this' for use inside stream logic
-    let streamIterator: AsyncGenerator<GenerateContentResponse> = initialStreamResult;
+    const streamIterator: AsyncGenerator<GenerateContentResponse> = initialStreamResult;
+    const currentApiCallContents = [...currentContents];
+    const state = this;
 
     const streamState: StreamProcessingState & { isPausedForFunctionCalling?: boolean } = {
       accumulatedText: "",
@@ -511,119 +641,16 @@ export class GoogleGenAIProvider implements LLMProvider<string> {
     const readableStream = new ReadableStream<string>({
       async start(controller) {
         try {
-          let processingComplete = false;
-          let loopCount = 0; // Safety break
-          // Track contents for API calls, re-initialize if a second call happens
-          let currentApiCallContents = [...currentContents];
-
-          while (!processingComplete && loopCount < 10) {
-            loopCount++;
-            if (!streamIterator) {
-              console.error(
-                "[GoogleGenAIProvider] Stream iterator became null during processing loop.",
-              );
-              throw new Error("Stream iterator became null during processing loop.");
-            }
-
-            const currentChunkBuffer: GenerateContentResponse[] = [];
-            let functionCallsDetected: FunctionCall[] = [];
-            let finalChunkOfPass: GenerateContentResponse | null = null;
-
-            // Process each chunk in the stream
-            for await (const chunkResponse of streamIterator) {
-              finalChunkOfPass = chunkResponse;
-              await state._processStreamChunk(chunkResponse, controller, streamState, options);
-              currentChunkBuffer.push(chunkResponse);
-
-              // Aggregate function calls from all chunks in this pass
-              const callsInChunk = chunkResponse.functionCalls;
-              if (callsInChunk && callsInChunk.length > 0) {
-                functionCallsDetected.push(...callsInChunk);
-                // Don't pause here, process the whole stream first
-              }
-            }
-
-            // Check for function calls after processing all chunks
-            if (functionCallsDetected.length > 0) {
-              streamState.isPausedForFunctionCalling = true;
-
-              // Execute function calls
-              const functionResponses = await executeFunctionCalls(
-                functionCallsDetected,
-                availableTools,
-              );
-
-              const functionResponseParts: Part[] = functionResponses
-                .map((funcResponse) => {
-                  if (!funcResponse.id || !funcResponse.name || !funcResponse.response) {
-                    console.warn(
-                      "[GoogleGenAIProvider]Invalid FunctionResponse format, skipping:",
-                      funcResponse,
-                    );
-                    return null;
-                  }
-                  return createPartFromFunctionResponse(
-                    funcResponse.id,
-                    funcResponse.name,
-                    funcResponse.response,
-                  );
-                })
-                .filter((part): part is Part => part !== null);
-
-              if (functionResponseParts.length > 0) {
-                // Add model's turn (captured from the final chunk of the previous pass)
-                const modelTurnContent = finalChunkOfPass?.candidates?.[0]?.content;
-                if (modelTurnContent) {
-                  // Re-assign contents for the next call's history
-                  currentApiCallContents = [
-                    ...currentApiCallContents, // Previous history
-                    modelTurnContent, // Model's turn that led to function call
-                    { role: "function", parts: functionResponseParts }, // Function results
-                  ];
-                } else {
-                  console.warn(
-                    "[GoogleGenAIProvider] Could not reliably determine model's content for history. Next call might lack context.",
-                  );
-                  // Proceed, but history for the next call might be incomplete
-                  currentApiCallContents = [
-                    ...currentApiCallContents, // Previous history
-                    { role: "function", parts: functionResponseParts }, // Function results only
-                  ];
-                }
-
-                // Prepare config for the next call (remove tools)
-                const { tools, toolConfig, ...secondCallConfigBase } = initialConfig;
-                const secondCallConfig = secondCallConfigBase;
-
-                const secondGenParams: GenerateContentParameters = {
-                  contents: currentApiCallContents, // Use updated contents
-                  model: model,
-                  ...(Object.keys(secondCallConfig).length > 0 ? { config: secondCallConfig } : {}),
-                };
-
-                // Assign the new stream iterator
-                streamIterator = await state.ai.models.generateContentStream(secondGenParams);
-                streamState.isPausedForFunctionCalling = false; // Unpause for the next pass
-                functionCallsDetected = []; // Reset for next pass
-                // Loop continues with the new iterator
-              } else {
-                console.warn(
-                  "[GoogleGenAIProvider] No valid function responses generated. Finalizing stream.",
-                );
-                processingComplete = true; // Stop loop if responses are invalid
-              }
-            } else {
-              // No function calls detected in this pass, the stream finished naturally or with a terminal reason
-              processingComplete = true; // Mark as complete to exit the while loop
-            }
-          } // End while(!processingComplete)
-
-          if (loopCount >= 10) {
-            console.warn(
-              "[GoogleGenAIProvider] Exited stream processing loop due to reaching max iterations (10). Finalizing.",
-            );
-          }
-
+          await state._processStreamWithFunctionCalls(
+            streamIterator,
+            controller,
+            streamState,
+            options,
+            availableTools,
+            currentApiCallContents,
+            model,
+            initialConfig,
+          );
           await state._finalizeStream(streamState, options, controller);
         } catch (error) {
           console.error(
