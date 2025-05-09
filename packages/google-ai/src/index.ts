@@ -466,8 +466,43 @@ export class GoogleGenAIProvider implements LLMProvider<string> {
     currentApiCallContents: Content[],
     model: string,
     initialConfig: GenerateContentConfig,
+    options: GoogleStreamTextOptions,
   ): Promise<AsyncGenerator<GenerateContentResponse> | null> {
+    functionCallsDetected.forEach((functionCall) => {
+      if (!functionCall.id) {
+        // should have a random id. For example: 'call_o0eSbOWhYH2mvL6ogbbXn5uH'
+        functionCall.id = `call_${Math.random().toString(36).substring(2)}${Date.now().toString(36)}`;
+      }
+    });
+
+    // Add tool-call step before executing functions
+    if (options.onChunk) {
+      for (const functionCall of functionCallsDetected) {
+        const step = this._createStepFromChunk({
+          type: "tool-call",
+          toolCallId: functionCall.id,
+          toolName: functionCall.name,
+          args: functionCall.args,
+        });
+        if (step) await options.onChunk(step);
+      }
+    }
+
     const functionResponses = await executeFunctionCalls(functionCallsDetected, availableTools);
+
+    // Add tool-result step after executing functions
+    if (options.onChunk) {
+      for (const funcResponse of functionResponses) {
+        const step = this._createStepFromChunk({
+          type: "tool-result",
+          toolCallId: funcResponse.id,
+          toolName: funcResponse.name,
+          result: funcResponse.response?.output,
+          usage: undefined,
+        });
+        if (step) await options.onChunk(step);
+      }
+    }
 
     const functionResponseParts: Part[] = functionResponses
       .map((funcResponse) => {
@@ -571,6 +606,7 @@ export class GoogleGenAIProvider implements LLMProvider<string> {
           currentApiCallContents,
           model,
           initialConfig,
+          options,
         );
 
         if (newIterator) {
