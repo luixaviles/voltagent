@@ -47,7 +47,7 @@ export function prepareToolsForGoogleSDK(
 
   return {
     tools: { functionDeclarations },
-    toolConfig: createDefaultToolConfig(tools),
+    toolConfig: createDefaultToolConfig(),
   };
 }
 
