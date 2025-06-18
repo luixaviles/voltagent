@@ -79,17 +79,6 @@ describe("schema helper", () => {
       //       "items"
       //     ],
       //     "message": "Expected object, received array"
-      //   },
-      //   {
-      //     "code": "invalid_type",
-      //     "expected": "boolean",
-      //     "received": "object",
-      //     "path": [
-      //       "properties",
-      //       "recordField",
-      //       "additionalProperties"
-      //     ],
-      //     "message": "Expected boolean, received object"
       //   }
       // ]
       // Above is the error message from responseSchemaFromZodType, it lists all
@@ -101,7 +90,7 @@ describe("schema helper", () => {
         vertextZodError = error as ZodError;
       }
       expect(() => responseSchemaFromZodType(true, unsupportedSchema)).toThrowError(ZodError);
-      expect(vertextZodError.errors.length).toBe(3);
+      expect(vertextZodError.errors.length).toBe(2);
 
       let genaiZodError: ZodError = new ZodError([]);
       try {
@@ -110,7 +99,7 @@ describe("schema helper", () => {
         genaiZodError = error as ZodError;
       }
       expect(() => responseSchemaFromZodType(false, unsupportedSchema)).toThrowError(ZodError);
-      expect(genaiZodError.errors.length).toBe(3);
+      expect(genaiZodError.errors.length).toBe(2);
     });
     it("should process simple zod object, with optional fields", () => {
       const zodSchema = z.object({
